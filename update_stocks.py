@@ -15,7 +15,7 @@ import requests
 
 # 노션 API 설정
 NOTION_API_KEY = os.environ.get('NOTION_API_KEY')
-NOTION_DATABASE_ID = os.environ.get('NOTION_DATABASE_ID', '2615eba7-9f12-4c2b-8bac-a64b28784005')
+NOTION_DATABASE_ID = os.environ.get('NOTION_DATABASE_ID', '42c8793f07f84faf96ef46a1ed45579a')
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_API_KEY}",
     "Content-Type": "application/json",
@@ -84,12 +84,25 @@ def determine_ma_signal(current_price: float, sma20: float, sma50: float, sma200
 def get_stock_data(ticker: str, market: str) -> Optional[Dict]:
     """주식 데이터 수집"""
     try:
+        # User-Agent 추가하여 차단 방지
         stock = yf.Ticker(ticker)
         
-        # 히스토리 데이터 가져오기 (최대 1년)
-        hist = stock.history(period="1y")
-        if hist.empty:
-            print(f"❌ {ticker}: 데이터 없음")
+        # 히스토리 데이터 가져오기 (최대 1년, 재시도 포함)
+        hist = None
+        for attempt in range(3):
+            try:
+                hist = stock.history(period="1y")
+                if not hist.empty:
+                    break
+                print(f"⚠️  {ticker}: 재시도 {attempt + 1}/3")
+            except Exception as e:
+                print(f"⚠️  {ticker}: 다운로드 오류 (시도 {attempt + 1}/3): {str(e)}")
+                if attempt < 2:
+                    import time
+                    time.sleep(2)
+        
+        if hist is None or hist.empty:
+            print(f"❌ {ticker}: 데이터 없음 (3회 재시도 후)")
             return None
         
         info = stock.info
