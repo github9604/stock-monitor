@@ -1,0 +1,45 @@
+name: 📈 주식 데이터 자동 업데이트
+
+on:
+  # 5분마다 실행 (시장 시간대에 맞춰 조정 가능)
+  schedule:
+    - cron: '*/5 * * * *'  # 매 5분마다
+  
+  # 수동 실행 가능
+  workflow_dispatch:
+  
+  # Push 시에도 실행 (테스트용)
+  push:
+    branches: [ main ]
+
+jobs:
+  update-stock-data:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: 📥 코드 체크아웃
+      uses: actions/checkout@v4
+    
+    - name: 🐍 Python 설정
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+    
+    - name: 📦 의존성 설치
+      run: |
+        pip install -r requirements.txt
+    
+    - name: 🚀 주식 데이터 업데이트
+      env:
+        NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+        NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+        STOCK_TICKERS: ${{ secrets.STOCK_TICKERS }}
+      run: |
+        python update_stocks.py
+    
+    - name: 📊 결과 요약
+      if: always()
+      run: |
+        echo "✅ 주식 데이터 업데이트 완료"
+        echo "⏰ $(date)"
