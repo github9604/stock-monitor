@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
 """
-실시간 주식 모니터링 - yfinance (User-Agent 우회)
-GitHub Actions에서 작동하도록 개선된 버전
+실시간 주식 모니터링 - 노션 자동 업데이트 (Alpha Vantage API)
+GitHub Actions 환경에서 안정적으로 작동하도록 최적화되었습니다.
 """
 
 import os
 import json
+import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
-import yfinance as yf
-import numpy as np
 import requests
+import numpy as np
 
-# User-Agent 설정으로 차단 우회
-import requests_cache
-session = requests.Session()
-session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-})
 
-# 노션 API 설정
+# API 설정
 NOTION_API_KEY = os.environ.get('NOTION_API_KEY')
 NOTION_DATABASE_ID = os.environ.get('NOTION_DATABASE_ID', '42c8793f07f84faf96ef46a1ed45579a')
+ALPHA_VANTAGE_API_KEY = os.environ.get('ALPHA_VANTAGE_API_KEY', 'demo')  # 무료 키로 교체 필요
+
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_API_KEY}",
     "Content-Type": "application/json",
@@ -29,11 +25,12 @@ NOTION_HEADERS = {
 }
 
 
-def calculate_rsi(prices: np.ndarray, period: int = 30) -> float:
+def calculate_rsi(prices: List[float], period: int = 30) -> float:
     """RSI 계산"""
     if len(prices) < period + 1:
         return None
     
+    prices = np.array(prices)
     deltas = np.diff(prices)
     gains = np.where(deltas > 0, deltas, 0)
     losses = np.where(deltas < 0, -deltas, 0)
@@ -53,14 +50,14 @@ def calculate_rsi(prices: np.ndarray, period: int = 30) -> float:
     return round(rsi, 2)
 
 
-def calculate_sma(prices: np.ndarray, period: int) -> Optional[float]:
+def calculate_sma(prices: List[float], period: int) -> Optional[float]:
     """단순 이동평균 계산"""
     if len(prices) < period:
         return None
     return round(np.mean(prices[-period:]), 2)
 
 
-def determine_ma_signal(current_price: float, sma20: float, sma50: float, sma200: float) -> str:
+def determine_ma_signal(sma20: float, sma50: float, sma200: float) -> str:
     """이동평균선 배열 상태 판단"""
     if not all([sma20, sma50, sma200]):
         return "-"
@@ -81,80 +78,133 @@ def determine_ma_signal(current_price: float, sma20: float, sma50: float, sma200
         return "-"
 
 
-def get_stock_data(ticker: str, market: str) -> Optional[Dict]:
-    """주식 데이터 수집 (yfinance with User-Agent)"""
+def get_stock_data_av(ticker: str, market: str) -> Optional[Dict]:
+    """Alpha Vantage API로 주식 데이터 수집"""
+    
+    # 한국 주식은 티커 변환
+    if market == "한국":
+        # .KS 또는 .KQ 제거
+        base_ticker = ticker.replace('.KS', '').replace('.KQ', '')
+        # Alpha Vantage는 한국 주식을 지원하지 않으므로 다른 API 사용 필요
+        print(f"⚠️  {ticker}: Alpha Vantage는 한국 주식 미지원 (임시 스킵)")
+        return None
+    
     try:
-        # User-Agent가 설정된 세션으로 yfinance 사용
-        stock = yf.Ticker(ticker, session=session)
+        # 1. 일일 가격 데이터 (최근 100일)
+        daily_url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={ticker}&apikey={ALPHA_VANTAGE_API_KEY}"
+        response = requests.get(daily_url, timeout=10)
         
-        # 히스토리 데이터 가져오기 (최대 1년, 재시도 포함)
-        hist = None
-        for attempt in range(3):
-            try:
-                hist = stock.history(period="1y")
-                if not hist.empty:
-                    break
-                print(f"⚠️  {ticker}: 재시도 {attempt + 1}/3")
-            except Exception as e:
-                print(f"⚠️  {ticker}: 다운로드 오류 (시도 {attempt + 1}/3): {str(e)}")
-                if attempt < 2:
-                    import time
-                    time.sleep(2)
-        
-        if hist is None or hist.empty:
-            print(f"❌ {ticker}: 데이터 없음 (3회 재시도 후)")
+        if response.status_code != 200:
+            print(f"❌ {ticker}: API 호출 실패 ({response.status_code})")
             return None
         
-        info = stock.info
-        current_price = hist['Close'].iloc[-1]
+        data = response.json()
         
-        # 5일 평균 거래량
-        avg_volume_5d = hist['Volume'].tail(5).mean()
-        current_volume = hist['Volume'].iloc[-1]
+        if "Error Message" in data:
+            print(f"❌ {ticker}: {data['Error Message']}")
+            return None
+        
+        if "Note" in data:
+            print(f"⚠️  {ticker}: API 호출 제한 도달")
+            return None
+        
+        time_series = data.get("Time Series (Daily)", {})
+        if not time_series:
+            print(f"❌ {ticker}: 데이터 없음")
+            return None
+        
+        # 날짜순 정렬
+        dates = sorted(time_series.keys())
+        if len(dates) < 2:
+            print(f"❌ {ticker}: 데이터 부족")
+            return None
+        
+        # 최신 데이터
+        latest_date = dates[-1]
+        latest = time_series[latest_date]
+        current_price = float(latest['4. close'])
+        current_volume = int(float(latest['5. volume']))
+        
+        # 이전일 종가 (등락률 계산용)
+        prev_date = dates[-2]
+        prev_close = float(time_series[prev_date]['4. close'])
+        change_pct = (current_price / prev_close - 1) if prev_close > 0 else 0
+        
+        # 종가 리스트 (이동평균 계산용)
+        closes = [float(time_series[d]['4. close']) for d in dates]
+        volumes = [int(float(time_series[d]['5. volume'])) for d in dates[-5:]]
+        
+        # 거래량 분석
+        avg_volume_5d = np.mean(volumes)
         volume_ratio = (current_volume / avg_volume_5d - 1) if avg_volume_5d > 0 else 0
         
         # 이동평균 계산
-        closes = hist['Close'].values
         sma20 = calculate_sma(closes, 20)
         sma50 = calculate_sma(closes, 50)
-        sma200 = calculate_sma(closes, 200)
+        sma200 = calculate_sma(closes, 200) if len(closes) >= 200 else None
         
         # RSI 계산
         rsi30 = calculate_rsi(closes, 30)
         
-        # 52주 최고/최저
-        high_52w = hist['High'].max()
-        low_52w = hist['Low'].min()
+        # 52주 최고/최저 (최근 1년 = 252 거래일)
+        recent_prices = closes[-252:] if len(closes) >= 252 else closes
+        high_52w = max(recent_prices)
+        low_52w = min(recent_prices)
         
-        # 등락률 계산
-        prev_close = hist['Close'].iloc[-2] if len(hist) > 1 else current_price
-        change_pct = (current_price / prev_close - 1) if prev_close > 0 else 0
+        # 골든크로스/데드크로스
+        ma_signal = determine_ma_signal(sma20, sma50, sma200)
         
-        # 골든크로스/데드크로스 판단
-        ma_signal = determine_ma_signal(current_price, sma20, sma50, sma200)
+        # 2. 기업 개요 (PER, PBR, 시가총액)
+        overview_url = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={ticker}&apikey={ALPHA_VANTAGE_API_KEY}"
+        overview_response = requests.get(overview_url, timeout=10)
         
-        # 시가총액 (억원/백만달러)
-        market_cap = info.get('marketCap')
-        if market_cap:
-            if market == "한국":
-                market_cap = market_cap / 100_000_000  # 억원
-            else:
-                market_cap = market_cap / 1_000_000  # 백만달러
+        per = None
+        pbr = None
+        market_cap = None
+        company_name = ticker
         
-        data = {
-            "종목명": info.get('longName') or info.get('shortName') or ticker,
+        if overview_response.status_code == 200:
+            overview = overview_response.json()
+            company_name = overview.get('Name', ticker)
+            
+            # PER
+            pe_ratio = overview.get('PERatio')
+            if pe_ratio and pe_ratio != 'None':
+                try:
+                    per = float(pe_ratio)
+                except:
+                    pass
+            
+            # PBR
+            pb_ratio = overview.get('PriceToBookRatio')
+            if pb_ratio and pb_ratio != 'None':
+                try:
+                    pbr = float(pb_ratio)
+                except:
+                    pass
+            
+            # 시가총액 (백만달러)
+            mkt_cap = overview.get('MarketCapitalization')
+            if mkt_cap and mkt_cap != 'None':
+                try:
+                    market_cap = float(mkt_cap) / 1_000_000  # 백만달러로 변환
+                except:
+                    pass
+        
+        data_dict = {
+            "종목명": company_name,
             "티커": ticker,
             "시장": market,
             "현재가": round(current_price, 2),
             "등락률": round(change_pct, 4),
-            "거래량": int(current_volume),
+            "거래량": current_volume,
             "5일평균거래량대비": round(volume_ratio, 4),
             "SMA20": sma20,
             "SMA50": sma50,
             "SMA200": sma200,
             "RSI30": rsi30,
-            "PER": info.get('trailingPE'),
-            "PBR": info.get('priceToBook'),
+            "PER": per,
+            "PBR": pbr,
             "시가총액": round(market_cap, 2) if market_cap else None,
             "52주최고가": round(high_52w, 2),
             "52주최저가": round(low_52w, 2),
@@ -162,18 +212,16 @@ def get_stock_data(ticker: str, market: str) -> Optional[Dict]:
             "업데이트시각": datetime.now(timezone.utc).isoformat()
         }
         
-        print(f"✅ {ticker} ({data['종목명']}): {current_price:,.2f} ({change_pct*100:+.2f}%)")
-        return data
+        print(f"✅ {ticker} ({company_name}): ${current_price:,.2f} ({change_pct*100:+.2f}%)")
+        return data_dict
         
     except Exception as e:
         print(f"❌ {ticker} 오류: {str(e)}")
-        import traceback
-        traceback.print_exc()
         return None
 
 
 def get_existing_pages() -> Dict[str, str]:
-    """노션 DB의 기존 페이지 조회 (티커 -> page_id 매핑)"""
+    """노션 DB의 기존 페이지 조회"""
     url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
     all_pages = {}
     has_more = True
@@ -188,7 +236,6 @@ def get_existing_pages() -> Dict[str, str]:
         
         if response.status_code != 200:
             print(f"❌ 노션 조회 실패: {response.status_code}")
-            print(response.text)
             return {}
         
         data = response.json()
@@ -268,33 +315,27 @@ def create_or_update_page(stock_data: Dict, existing_pages: Dict[str, str]) -> b
 def main():
     """메인 실행 함수"""
     print("=" * 60)
-    print("🚀 주식 데이터 수집 시작 (yfinance with User-Agent)")
+    print("🚀 주식 데이터 수집 시작 (Alpha Vantage API)")
     print(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
     
-    # 추적할 종목 목록
+    # 미국 주식만 (Alpha Vantage 제한)
     stocks = [
-        # 미국 주식
         {"ticker": "AAPL", "market": "미국"},
         {"ticker": "MSFT", "market": "미국"},
         {"ticker": "GOOGL", "market": "미국"},
         {"ticker": "NVDA", "market": "미국"},
         {"ticker": "TSLA", "market": "미국"},
-        
-        # 한국 주식
-        {"ticker": "005930.KS", "market": "한국"},  # 삼성전자
-        {"ticker": "000660.KS", "market": "한국"},  # SK하이닉스
-        {"ticker": "035720.KS", "market": "한국"},  # 카카오
-        {"ticker": "035420.KS", "market": "한국"},  # NAVER
-        {"ticker": "207940.KS", "market": "한국"},  # 삼성바이오로직스
     ]
     
-    # 환경변수에서 종목 목록 읽기
+    # 환경변수에서 종목 로드
     stocks_env = os.environ.get('STOCK_TICKERS')
     if stocks_env:
         try:
             stocks = json.loads(stocks_env)
-            print(f"📋 환경변수에서 {len(stocks)}개 종목 로드")
+            # 한국 주식 필터링
+            stocks = [s for s in stocks if s['market'] == '미국']
+            print(f"📋 환경변수에서 미국 주식 {len(stocks)}개 로드")
         except:
             print("⚠️  환경변수 파싱 실패, 기본 종목 사용")
     
@@ -303,11 +344,15 @@ def main():
     success_count = 0
     fail_count = 0
     
-    for stock_info in stocks:
+    for i, stock_info in enumerate(stocks):
         ticker = stock_info['ticker']
         market = stock_info['market']
         
-        stock_data = get_stock_data(ticker, market)
+        # API 호출 제한 방지 (무료: 분당 5회)
+        if i > 0:
+            time.sleep(12)  # 12초 대기
+        
+        stock_data = get_stock_data_av(ticker, market)
         
         if stock_data:
             if create_or_update_page(stock_data, existing_pages):
